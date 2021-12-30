@@ -20,57 +20,69 @@ from dataclasses import dataclass
 
 
 # Decay Function
-def decay(x,a,c, max_v):
+def decay(x,a,c, max_v) -> float:
     "Decay function where tau (c) * ln(90/10) gives the ringdown time."
     # c = tau
     return a + max_v*np.exp(-x/c) # A + V0*e^(-x/c)
 
 def from_raw_df(data: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
-    "Given dataframe created from CSV, returns the dataframe with the offset applied as well as key values in a dictionary"
+    "Given a dataframe created from CSV, returns time normalized dataframe as well as useful parameters labeled in a dictionary."
+    # Calculated Ringdown indexes
+    start_full = (data['(V)'] == max(data['(V)'])).idxmax()
+    end_full = (data['(us)'] >= parameters.time_end).idxmax()
+    max_v = max(data['(V)'][start_full:end_full])
 
-    start_full = (data['(V)'] == max(data['(V)'])).idxmax() #index of first instance of V = max(V) = True
-    end_full = (data['(us)'] >= parameters.time_end).idxmax() #index of first instance of time >= user-defined end marker = True
-    offset = [data['(us)'][start_full], 0] #offset = [time offset, voltage offset], Voltage offset = 0
-    data = data.sub(offset) #Subtract offset from dataframe; [time - time offset, Voltage - 0]
+    # Normalize ringdown start time to 0
+    offset = [data['(us)'][start_full], 0] #[time offset, voltage offset]: Time offset = time where V = max(V), Voltage offset = 0
+    data = data.sub(offset) 
     
-    # Finding Range of Voltage values to determine the 90-10 value range      
+    # Raw Ringdown indexes
     vrange = max(data['(V)'][start_full:end_full]) - min(data['(V)'][start_full:end_full])
     vmax = max(data['(V)'][start_full:end_full]) - (0.1 * vrange)
     vmin = min(data['(V)'][start_full:end_full]) + (0.1 * vrange)
 
-    # Start and End positions based on 90-10 value range
     start = (data['(V)'][start_full:end_full] <= vmax).idxmax()
     end = (data['(V)'][start_full:end_full] <= vmin).idxmax()
-    max_v = max(data['(V)'][start_full:end_full])
+    
     return (data, {'Start': start_full, 'End': end_full, '90 Start': start, '10 End': end, 'Max Voltage': max_v})
 
 
 def get_calc_ringdown(data: pd.DataFrame, indexes: dict) -> dict:
     '''Fits data to decay function, then calculates the ringdown value
     from tau by multiplying by ln(90/10). Returns ringdown time and standard error (1 stdev).'''
+
     time = data['(us)'][indexes['Start']:indexes['End']]
     voltage = data['(V)'][indexes['Start']:indexes['End']]
     max_v = indexes['Max Voltage']
 
     popt, pcov = curve_fit(lambda x, a, c: decay(x,a,c, max_v), 
                            time,
-                           voltage)
+                           voltage,
+                           bounds= (parameters.lower_bounds, parameters.upper_bounds)
+                           )
 
-    ringdown = popt[1] * np.log(9)
-    return {'Ringdown': ringdown, 'Error': np.sqrt(np.diag(pcov))[1]}
+    ringdown = popt[1] * np.log(9) #popt[1] is TAU, popt[0] is Voltage offset
+    return {'Calc Ringdown': ringdown, 'Error': np.sqrt(np.diag(pcov))[1]}
 
 def get_raw_ringdown(data, indexes) -> pd.DataFrame:
+    '''Calculates RAW ringdown through simple subtraction between time at 90% and 10% V values.'''
     raw = data.iloc[indexes['90 Start']:indexes['10 End']]
-    raw_ringdown = max(raw['(us)'])-min(raw['(us)'])
+    raw_ringdown = max(raw['(us)']) - min(raw['(us)'])
     return raw_ringdown
 
-def compile_data(df) -> pd.DataFrame:
+def compile_data(df: pd.DataFrame) -> dict:
+    '''Sends DataFrame from CSV data to appropriate functions and returns a row of data containing:
+        - Calculated Ringdown time
+        - Standard Error of Calculated Ringdown time
+        - Raw Ringdown time
+        - Difference between calculated and raw ringdown time.'''
+
     data, indexes = from_raw_df(df)
     calculated_ringdown = get_calc_ringdown(data, indexes)
     r_ringdown = {'Raw Ringdown':get_raw_ringdown(data, indexes)}
-    difference = {'Difference': calculated_ringdown['Ringdown']-r_ringdown['Raw Ringdown']}
-    rows = {**calculated_ringdown, **r_ringdown, **difference}
-    return rows
+    difference = {'Difference': calculated_ringdown['Calc Ringdown'] - r_ringdown['Raw Ringdown']}
+    row = {**calculated_ringdown, **r_ringdown, **difference}
+    return row
 
 
 @dataclass
@@ -78,17 +90,23 @@ class parameters:
     "Container for parameters"
     data_path: str = 'P:\\JeffC\\ringdown raw data\\11-05-2021 633\\20211105-0002\\'
     time_end: int = 350
+    lower_bounds = [-1, 0]
+    upper_bounds = [0, 50]
 
 def main():
+    '''Glob csv files from data_path and feed into pandas DataFrames,
+    then feed DataFrame data into curve_fit to extract TAU.
+    Compiles a DataFrame containing the ringdown time from every measurement.
+    Returns the MEAN of ringdown time, error, and difference.'''
 
-    start_time = time.time()
+    start_time = time.time() # Timing how long script takes to run
 
     data_path = parameters.data_path
     data_files = glob.glob(data_path + '*.csv')
 
     df_generator = (pd.read_csv(csv, skiprows=1) for csv in data_files)
 
-    data = pd.DataFrame(columns =['Ringdown', 'Error', 'Raw Ringdown', 'Difference'])
+    data = pd.DataFrame(columns =['Calc Ringdown', 'Error', 'Raw Ringdown', 'Difference'])
     for df in df_generator:
         data = data.append(compile_data(df), ignore_index = True)
 
